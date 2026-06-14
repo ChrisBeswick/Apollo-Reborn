@@ -47,18 +47,9 @@
 //
 // =============================================================================
 
-// Redirect targets on RDKClient. `linksFromWebsite:` is RedditKit's purpose-built
-// /domain/<website> listing primitive — a sibling of -linksInSubredditWithName:
-// in the same Links category, so its completion block has the identical shape
-// (NSArray<RDKLink*>*, RDKPagination*, NSError*) and we can forward Apollo's own
-// block unchanged. `fullPostListingWithPath:` is the generic listing builder both
-// of those funnel into; kept declared here as a drop-in fallback (path
-// "domain/<x>") if a Hopper pass ever shows linksFromWebsite: doesn't hit /domain/.
-// Declared on NSObject so we don't need RDKClient's full @interface here.
-@interface NSObject (ApolloDomainListingsRDK)
-- (id)linksFromWebsite:(id)website pagination:(id)pagination completion:(id)completion;
-- (id)fullPostListingWithPath:(id)path parameters:(id)parameters pagination:(id)pagination completion:(id)completion;
-@end
+// We redirect domain feeds by rewriting the listing PATH at RDKClient's generic
+// funnel (see "API redirect" below) and only ever call the originals via %orig,
+// so no RDKClient method declarations are needed here.
 
 // =============================================================================
 // MARK: - Token registry (domain <-> opaque subreddit-name slug)
@@ -169,30 +160,75 @@ void ApolloDomainListingsOpen(NSString *domain) {
 }
 
 // =============================================================================
-// MARK: - API redirect: subreddit-name fetch -> /domain/ endpoint
+// MARK: - API redirect: rewrite the listing PATH r/<token> -> domain/<domain>
 // =============================================================================
+//
+// Every typed links query (linksInSubredditWithName:category:…, its pagination
+// follow-ups, etc.) funnels into RDKClient's generic path-based listing builders
+// with a fully-formed path like "r/<token>/top" — and Apollo has already attached
+// the sort suffix and any time-filter params (t=week, …). By rewriting only the
+// path PREFIX at that funnel ("r/<token>" -> "domain/<domain>") and forwarding the
+// parameters/pagination/completion untouched, sorting, time-filtering AND
+// pagination all work, with no dependency on RDKSubredditCategory's raw values.
+
+// "r/<token>[/<sort>][.json]" -> "domain/<domain>[/<sort>][.json]" when <token> is
+// one of ours. Returns the SAME object when there's nothing to rewrite, so callers
+// can cheaply detect a no-op via pointer identity.
+static NSString *ApolloDomainListingsRewriteListingPath(NSString *path) {
+    if (![path isKindOfClass:[NSString class]] || path.length == 0) return path;
+
+    NSArray<NSString *> *comps = [path componentsSeparatedByString:@"/"];
+    for (NSUInteger i = 0; i + 1 < comps.count; i++) {
+        if (![comps[i] isEqualToString:@"r"]) continue;
+
+        NSString *tokenComp = comps[i + 1];          // "ardomain0" or "ardomain0.json"
+        NSString *tokenName = tokenComp;
+        NSString *tokenExt = @"";
+        NSRange dot = [tokenComp rangeOfString:@"."];
+        if (dot.location != NSNotFound) {
+            tokenName = [tokenComp substringToIndex:dot.location];
+            tokenExt = [tokenComp substringFromIndex:dot.location]; // includes the "."
+        }
+
+        NSString *domain = ApolloDomainListingsDomainForToken(tokenName);
+        if (!domain) continue;
+
+        NSMutableArray<NSString *> *out = [comps mutableCopy];
+        out[i] = @"domain";
+        out[i + 1] = [domain stringByAppendingString:tokenExt];
+        NSString *rewritten = [out componentsJoinedByString:@"/"];
+        ApolloLog(@"[DomainListings] Path rewrite '%@' -> '%@'", path, rewritten);
+        return rewritten;
+    }
+    return path;
+}
 
 %hook RDKClient
 
-- (id)linksInSubredditWithName:(id)name category:(long long)category pagination:(id)pagination completion:(id)completion {
-    NSString *domain = ApolloDomainListingsDomainForToken(name);
-    if (domain) {
-        // NOTE: `category` (the sort: hot/new/top/…) is dropped — linksFromWebsite:
-        // has no sort variant, so v1 serves the default (hot) listing. To add sort,
-        // swap to -fullPostListingWithPath:[@"domain/<x>" + confirmed suffix]…
-        // once Apollo's RDKSubredditCategory raw integer values are verified.
-        ApolloLog(@"[DomainListings] Redirect r/%@ (cat=%lld) -> /domain/%@", name, category, domain);
-        return [self linksFromWebsite:domain pagination:pagination completion:completion];
-    }
+// Hook every listing funnel a subreddit feed might use; the rewrite is a no-op
+// for non-token paths, and once one funnel rewrites the prefix the inner funnels
+// see "domain/<x>" and pass through, so there's no double-rewrite.
+- (id)fullPostListingWithPath:(id)path parameters:(id)parameters pagination:(id)pagination completion:(id)completion {
+    NSString *rewritten = ApolloDomainListingsRewriteListingPath(path);
+    if (rewritten != path) return %orig(rewritten, parameters, pagination, completion);
     return %orig;
 }
 
-- (id)linksInSubredditWithName:(id)name pagination:(id)pagination completion:(id)completion {
-    NSString *domain = ApolloDomainListingsDomainForToken(name);
-    if (domain) {
-        ApolloLog(@"[DomainListings] Redirect r/%@ -> /domain/%@", name, domain);
-        return [self linksFromWebsite:domain pagination:pagination completion:completion];
-    }
+- (id)postListingTaskWithPath:(id)path parameters:(id)parameters pagination:(id)pagination completion:(id)completion {
+    NSString *rewritten = ApolloDomainListingsRewriteListingPath(path);
+    if (rewritten != path) return %orig(rewritten, parameters, pagination, completion);
+    return %orig;
+}
+
+- (id)listingTaskWithPath:(id)path parameters:(id)parameters pagination:(id)pagination completion:(id)completion {
+    NSString *rewritten = ApolloDomainListingsRewriteListingPath(path);
+    if (rewritten != path) return %orig(rewritten, parameters, pagination, completion);
+    return %orig;
+}
+
+- (id)fullListingWithPath:(id)path parameters:(id)parameters pagination:(id)pagination completion:(id)completion {
+    NSString *rewritten = ApolloDomainListingsRewriteListingPath(path);
+    if (rewritten != path) return %orig(rewritten, parameters, pagination, completion);
     return %orig;
 }
 
@@ -267,20 +303,92 @@ void ApolloDomainListingsOpen(NSString *domain) {
 // =============================================================================
 // MARK: - Title polish: show the domain instead of the token slug
 // =============================================================================
+//
+// Apollo titles a subreddit feed with a custom nav-bar control
+// (DualLabelTitleButton), NOT navigationItem.title — so rewriting the title
+// string alone leaves the visible "r/ardomain0" untouched. We resolve the domain
+// from whichever surface carries the token (the title string OR a UILabel inside
+// the title view) and rewrite them all: the title string (also read by the
+// ApolloSubredditHeaders banner as a fallback) plus every token-bearing UILabel
+// in the title view. Re-applied on layout so it survives nav-bar relayout.
+
+// Map a displayed string ("ardomain0", "r/ardomain0", "/r/ardomain0") to its domain.
+static NSString *ApolloDomainListingsDomainForDisplayText(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return nil;
+    NSString *candidate = text;
+    if ([candidate hasPrefix:@"r/"] || [candidate hasPrefix:@"R/"]) candidate = [candidate substringFromIndex:2];
+    NSRange slash = [candidate rangeOfString:@"/" options:NSBackwardsSearch];
+    if (slash.location != NSNotFound && slash.location + 1 <= candidate.length) {
+        candidate = [candidate substringFromIndex:slash.location + 1];
+    }
+    return ApolloDomainListingsDomainForToken(candidate);
+}
+
+// Find the domain encoded in any UILabel within a view tree (e.g. the title view).
+static NSString *ApolloDomainListingsDomainFromLabelTree(UIView *view) {
+    if (!view) return nil;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *d = ApolloDomainListingsDomainForDisplayText(((UILabel *)view).text);
+        if (d) return d;
+    }
+    for (UIView *sub in view.subviews) {
+        NSString *d = ApolloDomainListingsDomainFromLabelTree(sub);
+        if (d) return d;
+    }
+    return nil;
+}
+
+// Rewrite every token-bearing UILabel in a view tree to the domain. Self-guarding:
+// once a label shows the domain (not a token), it no longer matches, so re-runs
+// from layout passes don't loop.
+static void ApolloDomainListingsRewriteTokenLabels(UIView *view, NSString *domain) {
+    if (!view) return;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if (ApolloDomainListingsDomainForDisplayText(label.text)) label.text = domain;
+    }
+    for (UIView *sub in view.subviews) ApolloDomainListingsRewriteTokenLabels(sub, domain);
+}
+
+// Resolve this feed's domain (if it's a token feed) and fix every title surface.
+// Idempotent; a no-op for normal subreddit feeds (no token → returns early).
+static void ApolloDomainListingsFixDomainTitle(UIViewController *vc) {
+    if (!vc) return;
+    @try {
+        UINavigationItem *navItem = vc.navigationItem;
+        UIView *titleView = navItem.titleView;
+
+        NSString *domain = ApolloDomainListingsDomainForDisplayText(navItem.title);
+        if (!domain) domain = ApolloDomainListingsDomainForDisplayText(vc.title);
+        if (!domain) domain = ApolloDomainListingsDomainFromLabelTree(titleView);
+        if (!domain) return;
+
+        if (![navItem.title isEqualToString:domain]) navItem.title = domain; // feeds the header banner fallback
+        if (![vc.title isEqualToString:domain]) vc.title = domain;
+        ApolloDomainListingsRewriteTokenLabels(titleView, domain);
+    } @catch (__unused NSException *e) {}
+}
 
 %hook PostsViewController
 
+- (void)viewDidLoad {
+    %orig;
+    ApolloDomainListingsFixDomainTitle((UIViewController *)self);
+}
+
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
-    @try {
-        UIViewController *vc = (UIViewController *)self;
-        NSString *title = vc.navigationItem.title.length ? vc.navigationItem.title : vc.title;
-        NSString *domain = ApolloDomainListingsDomainForToken(title);
-        if (domain) {
-            vc.navigationItem.title = domain;
-            vc.title = domain;
-        }
-    } @catch (__unused NSException *e) {}
+    ApolloDomainListingsFixDomainTitle((UIViewController *)self);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    ApolloDomainListingsFixDomainTitle((UIViewController *)self);
+}
+
+- (void)viewDidLayoutSubviews {
+    %orig;
+    ApolloDomainListingsFixDomainTitle((UIViewController *)self);
 }
 
 %end
