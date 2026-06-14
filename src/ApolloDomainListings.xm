@@ -22,28 +22,29 @@
 //   1. PostsViewController is listing-type-agnostic: render any feed by handing
 //      it a PostsType.subreddit(name). The whole UI (cells, sort bar, jump bar,
 //      pull-to-refresh, infinite scroll, media) comes for free.
-//   2. The first (and, for a non-existent subreddit, every) page is fetched by
-//      *name* via the ObjC-visible RDKClient -linksInSubredditWithName:… — which
-//      internally just builds path "r/<name>/<sort>" and calls
-//      -fullPostListingWithPath:…. The /domain/ endpoint is the identical shape.
+//   2. Every page is fetched by *name*, funnelling through RDKClient's generic
+//      path-based listing builders with a path like "r/<name>/<sort>". The
+//      /domain/ endpoint is the identical shape ("domain/<name>/<sort>").
 //   3. The tweak already routes reddit URLs into Apollo's native subreddit feed
 //      via ApolloRouteResolvedURLViaApolloScheme().
 //
-// Strategy: carry the domain through the subreddit pipeline behind an opaque,
-// validation-safe token, then redirect the fetch at the RDKClient layer.
+// Strategy: carry the domain straight through as the subreddit NAME (the domain
+// IS the handle — see "Stateless domain handle" below), then rewrite the listing
+// PATH at the RDKClient funnel.
 //
-//   tap/open  reddit.com/domain/imgur.com
-//     -> mint token "ardomain0" <-> "imgur.com"   (token registry)
-//     -> open apollo://reddit.com/r/ardomain0      (Apollo's own router)
-//     -> Apollo pushes PostsViewController(.subreddit("ardomain0"))
-//     -> RDKClient -linksInSubredditWithName:@"ardomain0" …
-//     -> WE redirect to -fullPostListingWithPath:@"domain/imgur.com" …
+//   tap/open  reddit.com/domain/imgur.com   (or search "domain:imgur.com")
+//     -> open apollo://reddit.com/r/imgur.com       (Apollo's own router)
+//     -> Apollo pushes PostsViewController(.subreddit("imgur.com"))
+//     -> listing request builds path "r/imgur.com/<sort>"
+//     -> WE rewrite the path -> "domain/imgur.com/<sort>" at the funnel
 //     -> feed renders imgur.com posts; title hook shows "imgur.com"
 //
-// A token (vs. passing the bare domain as the name) deliberately sidesteps
-// Apollo's subreddit-name validation — a real domain like "imgur.com" contains
-// a dot, which is illegal in subreddit names. The token is plain lowercase
-// alphanumerics that the /r/ router accepts verbatim.
+// Why the domain as the name (vs. an opaque token): a real subreddit name is
+// [A-Za-z0-9_] and can never contain a dot, so the dot is a stateless marker —
+// no registry, no persistence. A favourite is then just the string "imgur.com"
+// in Apollo's FavoriteSubreddits array, so it survives relaunch and reads
+// correctly with zero extra state. (Requires Apollo's /r/ router to accept a
+// dotted name verbatim, which it does — no name sanitisation strips the dot.)
 //
 // =============================================================================
 
@@ -52,13 +53,16 @@
 // so no RDKClient method declarations are needed here.
 
 // =============================================================================
-// MARK: - Token registry (domain <-> opaque subreddit-name slug)
+// MARK: - Stateless domain handle (the domain IS the subreddit name)
 // =============================================================================
-
-static NSMutableDictionary<NSString *, NSString *> *sDomainForToken; // token  -> domain
-static NSMutableDictionary<NSString *, NSString *> *sTokenForDomain; // domain -> token
-static NSUInteger sTokenCounter;
-static NSLock *sTokenLock;
+//
+// We carry the domain straight through Apollo as the "subreddit name" — e.g.
+// the feed for imgur.com is opened as r/imgur.com. Real subreddit names are
+// [A-Za-z0-9_] and can never contain a dot, so the presence of a dot is a
+// perfect, stateless marker: no token, no registry, no persistence. A favourite
+// is then just the plain string "imgur.com" (Apollo stores FavoriteSubreddits as
+// a string array), so it survives relaunch and reads correctly with zero extra
+// state. The path rewrite below turns r/imgur.com -> domain/imgur.com.
 
 // Normalize a domain to Reddit's canonical form for the /domain/ endpoint:
 // lowercase, no scheme, no path/slashes. Subdomains are preserved on purpose —
@@ -82,33 +86,41 @@ static NSString *ApolloDomainListingsNormalizeDomain(NSString *domain) {
     return d;
 }
 
-// Stable token for a domain (re-used across taps in a session so the same
-// domain doesn't leak unbounded tokens). The token is a clean lowercase
-// alphanumeric slug that passes Apollo's subreddit-name validation.
-static NSString *ApolloDomainListingsTokenForDomain(NSString *domain) {
-    NSString *d = ApolloDomainListingsNormalizeDomain(domain);
-    if (!d) return nil;
-
-    [sTokenLock lock];
-    NSString *token = sTokenForDomain[d];
-    if (!token) {
-        token = [NSString stringWithFormat:@"ardomain%lu", (unsigned long)sTokenCounter++];
-        sTokenForDomain[d] = token;
-        sDomainForToken[token] = d;
-    }
-    [sTokenLock unlock];
-    return token;
+// Treat a subreddit "name" as a domain handle iff it contains a dot. A trailing
+// ".json" API suffix is stripped first so a real subreddit fetched as JSON
+// ("pics.json") is never misread as a domain. Returns the normalized domain, or
+// nil for an ordinary subreddit name.
+static NSString *ApolloDomainListingsDomainFromName(NSString *name) {
+    if (![name isKindOfClass:[NSString class]] || name.length == 0) return nil;
+    NSString *n = name;
+    if ([[n lowercaseString] hasSuffix:@".json"]) n = [n substringToIndex:n.length - 5];
+    if ([n rangeOfString:@"."].location == NSNotFound) return nil;
+    return ApolloDomainListingsNormalizeDomain(n);
 }
 
-// Domain backing a token, or nil if `token` was never minted by us. Only tokens
-// we generated live in the map, so a real subreddit named "ardomain0" that the
-// user happens to open is never misrouted.
-static NSString *ApolloDomainListingsDomainForToken(NSString *token) {
-    if (![token isKindOfClass:[NSString class]] || token.length == 0) return nil;
-    [sTokenLock lock];
-    NSString *d = sDomainForToken[token];
-    [sTokenLock unlock];
-    return d;
+// A friendly display label for a domain: "imgur.com" -> "imgur",
+// "i.imgur.com" -> "imgur", "bbc.co.uk" -> "bbc". Best-effort — takes the
+// registrable label (the one before the public suffix), skipping a known set of
+// second-level suffixes (co.uk, com.au, …). This is DISPLAY ONLY; the full domain
+// remains the functional handle (favourites, routing, the /domain/ fetch).
+static NSString *ApolloDomainListingsDisplayNameForDomain(NSString *domain) {
+    NSString *d = ApolloDomainListingsNormalizeDomain(domain);
+    if (!d) return domain;
+    if ([d hasPrefix:@"www."]) d = [d substringFromIndex:4];
+
+    NSArray<NSString *> *labels = [d componentsSeparatedByString:@"."];
+    if (labels.count < 2) return d;
+
+    static NSSet<NSString *> *secondLevel = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        secondLevel = [NSSet setWithArray:@[ @"co", @"com", @"org", @"net", @"gov", @"edu", @"ac", @"or", @"ne", @"gob" ]];
+    });
+
+    NSInteger idx = (NSInteger)labels.count - 2;                          // label before the final TLD
+    if (idx > 0 && [secondLevel containsObject:labels[idx]]) idx -= 1;    // skip a co.uk-style suffix
+    NSString *label = labels[idx];
+    return label.length ? label : d;
 }
 
 // =============================================================================
@@ -136,21 +148,22 @@ NSString *ApolloDomainListingsDomainFromURL(NSURL *url) {
 }
 
 void ApolloDomainListingsOpen(NSString *domain) {
-    NSString *token = ApolloDomainListingsTokenForDomain(domain);
-    if (!token) {
+    NSString *d = ApolloDomainListingsNormalizeDomain(domain);
+    if (!d) {
         ApolloLog(@"[DomainListings] Open ignored — empty/invalid domain: %@", domain);
         return;
     }
 
-    // Route through Apollo's own subreddit feed. ApolloRouteResolvedURLViaApolloScheme
-    // converts this to apollo://reddit.com/r/<token>/ and opens it via UIApplication,
-    // which re-enters SceneDelegate -scene:openURLContexts: (not as a /domain/ URL,
-    // so we don't loop) and lets Apollo push the PostsViewController for us.
-    NSString *urlString = [NSString stringWithFormat:@"https://reddit.com/r/%@/", token];
+    // Open the domain AS a subreddit named after it. ApolloRouteResolvedURLViaApolloScheme
+    // converts this to apollo://reddit.com/r/<domain>/ and opens it via UIApplication,
+    // which re-enters our SceneDelegate hook (not as a /domain/ URL, so we don't loop)
+    // and lets Apollo push the PostsViewController. The path rewrite then turns the
+    // resulting r/<domain> listing request into the /domain/<domain> endpoint.
+    NSString *urlString = [NSString stringWithFormat:@"https://reddit.com/r/%@/", d];
     NSURL *url = [NSURL URLWithString:urlString];
 
     dispatch_block_t route = ^{
-        ApolloLog(@"[DomainListings] Opening domain '%@' via token feed %@", ApolloDomainListingsDomainForToken(token), urlString);
+        ApolloLog(@"[DomainListings] Opening domain '%@' via %@", d, urlString);
         if (!ApolloRouteResolvedURLViaApolloScheme(url)) {
             ApolloLog(@"[DomainListings] Route failed for %@", url);
         }
@@ -160,42 +173,33 @@ void ApolloDomainListingsOpen(NSString *domain) {
 }
 
 // =============================================================================
-// MARK: - API redirect: rewrite the listing PATH r/<token> -> domain/<domain>
+// MARK: - API redirect: rewrite the listing PATH r/<domain> -> domain/<domain>
 // =============================================================================
 //
 // Every typed links query (linksInSubredditWithName:category:…, its pagination
 // follow-ups, etc.) funnels into RDKClient's generic path-based listing builders
-// with a fully-formed path like "r/<token>/top" — and Apollo has already attached
+// with a fully-formed path like "r/imgur.com/top" — and Apollo has already attached
 // the sort suffix and any time-filter params (t=week, …). By rewriting only the
-// path PREFIX at that funnel ("r/<token>" -> "domain/<domain>") and forwarding the
+// path PREFIX at that funnel ("r/<domain>" -> "domain/<domain>") and forwarding the
 // parameters/pagination/completion untouched, sorting, time-filtering AND
 // pagination all work, with no dependency on RDKSubredditCategory's raw values.
 
-// "r/<token>[/<sort>][.json]" -> "domain/<domain>[/<sort>][.json]" when <token> is
-// one of ours. Returns the SAME object when there's nothing to rewrite, so callers
-// can cheaply detect a no-op via pointer identity.
+// "r/<domain>[/<sort>][.json]" -> "domain/<domain>[/<sort>][.json]" when the name
+// component is a domain (contains a dot). Only the "r" segment changes — the
+// domain, the sort suffix and any ".json" are preserved verbatim. Returns the SAME
+// object when there's nothing to rewrite, so callers detect a no-op via identity.
 static NSString *ApolloDomainListingsRewriteListingPath(NSString *path) {
     if (![path isKindOfClass:[NSString class]] || path.length == 0) return path;
 
     NSArray<NSString *> *comps = [path componentsSeparatedByString:@"/"];
     for (NSUInteger i = 0; i + 1 < comps.count; i++) {
         if (![comps[i] isEqualToString:@"r"]) continue;
-
-        NSString *tokenComp = comps[i + 1];          // "ardomain0" or "ardomain0.json"
-        NSString *tokenName = tokenComp;
-        NSString *tokenExt = @"";
-        NSRange dot = [tokenComp rangeOfString:@"."];
-        if (dot.location != NSNotFound) {
-            tokenName = [tokenComp substringToIndex:dot.location];
-            tokenExt = [tokenComp substringFromIndex:dot.location]; // includes the "."
-        }
-
-        NSString *domain = ApolloDomainListingsDomainForToken(tokenName);
-        if (!domain) continue;
+        // The component after "r" carries the domain (with its dots). A real
+        // subreddit name has no dot, so this never matches normal feeds.
+        if (!ApolloDomainListingsDomainFromName(comps[i + 1])) continue;
 
         NSMutableArray<NSString *> *out = [comps mutableCopy];
         out[i] = @"domain";
-        out[i + 1] = [domain stringByAppendingString:tokenExt];
         NSString *rewritten = [out componentsJoinedByString:@"/"];
         ApolloLog(@"[DomainListings] Path rewrite '%@' -> '%@'", path, rewritten);
         return rewritten;
@@ -301,27 +305,23 @@ static NSString *ApolloDomainListingsRewriteListingPath(NSString *path) {
 %end
 
 // =============================================================================
-// MARK: - Title polish: show the domain instead of the token slug
+// MARK: - Title polish: show "imgur.com" instead of "r/imgur.com"
 // =============================================================================
 //
 // Apollo titles a subreddit feed with a custom nav-bar control
 // (DualLabelTitleButton), NOT navigationItem.title — so rewriting the title
-// string alone leaves the visible "r/ardomain0" untouched. We resolve the domain
-// from whichever surface carries the token (the title string OR a UILabel inside
-// the title view) and rewrite them all: the title string (also read by the
-// ApolloSubredditHeaders banner as a fallback) plus every token-bearing UILabel
-// in the title view. Re-applied on layout so it survives nav-bar relayout.
+// string alone leaves the visible "r/imgur.com" untouched. We resolve the domain
+// from whichever surface carries it (the title string OR a UILabel inside the
+// title view) and rewrite them all to the bare domain: the title string (also
+// read by the ApolloSubredditHeaders banner as a fallback) plus every matching
+// UILabel in the title view. Re-applied on layout so it survives nav-bar relayout.
 
-// Map a displayed string ("ardomain0", "r/ardomain0", "/r/ardomain0") to its domain.
+// Map a displayed string ("imgur.com", "r/imgur.com") to its domain, or nil.
 static NSString *ApolloDomainListingsDomainForDisplayText(NSString *text) {
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return nil;
     NSString *candidate = text;
     if ([candidate hasPrefix:@"r/"] || [candidate hasPrefix:@"R/"]) candidate = [candidate substringFromIndex:2];
-    NSRange slash = [candidate rangeOfString:@"/" options:NSBackwardsSearch];
-    if (slash.location != NSNotFound && slash.location + 1 <= candidate.length) {
-        candidate = [candidate substringFromIndex:slash.location + 1];
-    }
-    return ApolloDomainListingsDomainForToken(candidate);
+    return ApolloDomainListingsDomainFromName(candidate);
 }
 
 // Find the domain encoded in any UILabel within a view tree (e.g. the title view).
@@ -363,9 +363,11 @@ static void ApolloDomainListingsFixDomainTitle(UIViewController *vc) {
         if (!domain) domain = ApolloDomainListingsDomainFromLabelTree(titleView);
         if (!domain) return;
 
-        if (![navItem.title isEqualToString:domain]) navItem.title = domain; // feeds the header banner fallback
-        if (![vc.title isEqualToString:domain]) vc.title = domain;
-        ApolloDomainListingsRewriteTokenLabels(titleView, domain);
+        // Show the friendly brand ("imgur"), not the raw "r/imgur.com".
+        NSString *display = ApolloDomainListingsDisplayNameForDomain(domain);
+        if (![navItem.title isEqualToString:display]) navItem.title = display;
+        if (![vc.title isEqualToString:display]) vc.title = display;
+        ApolloDomainListingsRewriteTokenLabels(titleView, display);
     } @catch (__unused NSException *e) {}
 }
 
@@ -428,10 +430,6 @@ static void ApolloDomainListingsFixDomainTitle(UIViewController *vc) {
 // =============================================================================
 
 %ctor {
-    sTokenLock = [[NSLock alloc] init];
-    sDomainForToken = [NSMutableDictionary dictionary];
-    sTokenForDomain = [NSMutableDictionary dictionary];
-
     Class sceneDelegate = objc_getClass("_TtC6Apollo13SceneDelegate");
     Class appDelegate = objc_getClass("_TtC6Apollo11AppDelegate");
     Class postsVC = objc_getClass("_TtC6Apollo19PostsViewController");
