@@ -44,6 +44,10 @@ on:
         required: false
         type: boolean
         default: false
+      bundle_id:
+        description: 'Rebrand to this bundle id to install ALONGSIDE stock Apollo (e.g. com.yourname.ApolloDomain). Leave blank to keep com.christianselig.Apollo.'
+        required: false
+        type: string
       output_name:
         description: 'Output IPA filename (without .ipa extension)'
         required: false
@@ -80,6 +84,10 @@ jobs:
           fi
           if [ "${{ github.event.inputs.no_extensions }}" == "true" ] && [ "${{ github.event.inputs.inject_tweak }}" != "true" ]; then
             echo "Error: 'no_extensions' only applies when 'inject_tweak' is enabled."
+            exit 1
+          fi
+          if [ -n "${{ github.event.inputs.bundle_id }}" ] && ! echo "${{ github.event.inputs.bundle_id }}" | grep -Eq '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'; then
+            echo "Error: 'bundle_id' must be reverse-DNS, e.g. com.yourname.ApolloDomain"
             exit 1
           fi
 
@@ -210,6 +218,9 @@ jobs:
           if [ -n "${{ github.event.inputs.url_schemes }}" ]; then
             SUFFIX="${SUFFIX}-URLSchemes"
           fi
+          if [ -n "${{ github.event.inputs.bundle_id }}" ]; then
+            SUFFIX="${SUFFIX}-Alt"
+          fi
           OUTPUT_IPA="${BASE}${SUFFIX}.ipa"
           echo "output_ipa=${OUTPUT_IPA}" >> "$GITHUB_OUTPUT"
           echo "Output filename: ${OUTPUT_IPA}"
@@ -254,6 +265,22 @@ jobs:
           fi
           echo "output_ipa=${OUTPUT_IPA}" >> "$GITHUB_OUTPUT"
           echo "Final IPA: ${OUTPUT_IPA} ($(wc -c < "$OUTPUT_IPA") bytes)"
+
+      - name: Rebrand bundle ID (install alongside stock Apollo)
+        if: ${{ github.event.inputs.bundle_id != '' }}
+        run: |
+          IPA="${{ steps.patch.outputs.output_ipa }}"
+          BUNDLE_ID="${{ github.event.inputs.bundle_id }}"
+          echo "Rebranding ${IPA} -> ${BUNDLE_ID} (app + every appex)"
+          chmod +x ./scripts/rebrand-ipa.sh
+          # Rewrites CFBundleIdentifier of the app and all appexes; deliberately
+          # keeps the app group, the apollo:// scheme, and keychain/Valet names
+          # intact. Strips signatures so your installer (AltStore/SideStore/
+          # codesign) re-seals from scratch. Done in place so downstream steps
+          # (validate/upload/release) operate on the same path unchanged.
+          ./scripts/rebrand-ipa.sh "${IPA}" "${BUNDLE_ID}" -o "${IPA}.rebranded"
+          mv -f "${IPA}.rebranded" "${IPA}"
+          echo "Rebranded in place: ${IPA}"
 
       - name: Validate output IPA
         if: inputs.inject_tweak
