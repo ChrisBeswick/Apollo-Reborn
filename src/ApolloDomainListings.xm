@@ -28,23 +28,24 @@
 //   3. The tweak already routes reddit URLs into Apollo's native subreddit feed
 //      via ApolloRouteResolvedURLViaApolloScheme().
 //
-// Strategy: carry the domain straight through as the subreddit NAME (the domain
-// IS the handle — see "Stateless domain handle" below), then rewrite the listing
-// PATH at the RDKClient funnel.
+// Strategy: carry the domain behind an opaque, dot-free slug that Apollo's /r/
+// router accepts as a normal subreddit (a dotted name like "imgur.com" is NOT
+// accepted — the router web-fallbacks on it), then rewrite the listing PATH at
+// the RDKClient funnel. The slug<->domain map is persisted so it survives relaunch.
 //
 //   tap/open  reddit.com/domain/imgur.com   (or search "domain:imgur.com")
-//     -> open apollo://reddit.com/r/imgur.com       (Apollo's own router)
-//     -> Apollo pushes PostsViewController(.subreddit("imgur.com"))
-//     -> listing request builds path "r/imgur.com/<sort>"
+//     -> mint/reuse slug "ardomain0" <-> "imgur.com"   (persisted token registry)
+//     -> open apollo://reddit.com/r/ardomain0          (Apollo's own router)
+//     -> Apollo pushes PostsViewController(.subreddit("ardomain0"))
+//     -> listing request builds path "r/ardomain0/<sort>"
 //     -> WE rewrite the path -> "domain/imgur.com/<sort>" at the funnel
-//     -> feed renders imgur.com posts; title hook shows "imgur.com"
+//     -> feed renders imgur.com posts; title hook shows "imgur"
 //
-// Why the domain as the name (vs. an opaque token): a real subreddit name is
-// [A-Za-z0-9_] and can never contain a dot, so the dot is a stateless marker —
-// no registry, no persistence. A favourite is then just the string "imgur.com"
-// in Apollo's FavoriteSubreddits array, so it survives relaunch and reads
-// correctly with zero extra state. (Requires Apollo's /r/ router to accept a
-// dotted name verbatim, which it does — no name sanitisation strips the dot.)
+// Why a slug (not the bare domain as the name): Apollo's /r/ router rejects a
+// dotted name and opens its in-app web view instead, so the domain can't be the
+// name directly. The slug is plain alphanumerics so it routes natively; the
+// persisted map (re)resolves slug -> domain after a restart, so a favourited
+// domain feed (Apollo stores the slug string in FavoriteSubreddits) keeps working.
 //
 // =============================================================================
 
@@ -53,16 +54,18 @@
 // so no RDKClient method declarations are needed here.
 
 // =============================================================================
-// MARK: - Stateless domain handle (the domain IS the subreddit name)
+// MARK: - Persistent token registry (domain <-> opaque subreddit-name slug)
 // =============================================================================
 //
-// We carry the domain straight through Apollo as the "subreddit name" — e.g.
-// the feed for imgur.com is opened as r/imgur.com. Real subreddit names are
-// [A-Za-z0-9_] and can never contain a dot, so the presence of a dot is a
-// perfect, stateless marker: no token, no registry, no persistence. A favourite
-// is then just the plain string "imgur.com" (Apollo stores FavoriteSubreddits as
-// a string array), so it survives relaunch and reads correctly with zero extra
-// state. The path rewrite below turns r/imgur.com -> domain/imgur.com.
+// Apollo's /r/ router REJECTS a dotted name like "imgur.com" — it can't be a real
+// community, so Apollo falls back to its in-app web view. We therefore carry the
+// domain behind an opaque, dot-free slug ("ardomain0") that the router accepts as
+// a normal subreddit name; the path rewrite below maps r/ardomain0 -> domain/imgur.com.
+//
+// The slug<->domain map is PERSISTED to NSUserDefaults (same store Apollo keeps
+// FavoriteSubreddits in) and reloaded on launch, so a favourited domain feed
+// still resolves after a restart. Slugs are stable: the same domain always reuses
+// its slug.
 
 // Normalize a domain to Reddit's canonical form for the /domain/ endpoint:
 // lowercase, no scheme, no path/slashes. Subdomains are preserved on purpose —
@@ -86,16 +89,67 @@ static NSString *ApolloDomainListingsNormalizeDomain(NSString *domain) {
     return d;
 }
 
-// Treat a subreddit "name" as a domain handle iff it contains a dot. A trailing
-// ".json" API suffix is stripped first so a real subreddit fetched as JSON
-// ("pics.json") is never misread as a domain. Returns the normalized domain, or
-// nil for an ordinary subreddit name.
-static NSString *ApolloDomainListingsDomainFromName(NSString *name) {
-    if (![name isKindOfClass:[NSString class]] || name.length == 0) return nil;
-    NSString *n = name;
-    if ([[n lowercaseString] hasSuffix:@".json"]) n = [n substringToIndex:n.length - 5];
-    if ([n rangeOfString:@"."].location == NSNotFound) return nil;
-    return ApolloDomainListingsNormalizeDomain(n);
+static NSMutableDictionary<NSString *, NSString *> *sDomainForToken; // token  -> domain
+static NSMutableDictionary<NSString *, NSString *> *sTokenForDomain; // domain -> token
+static NSUInteger sTokenCounter;
+static NSLock *sTokenLock;
+
+static NSString *const kApolloDomainTokenMapKey = @"ApolloDomainListingsTokenMap";
+static NSString *const kApolloDomainTokenCounterKey = @"ApolloDomainListingsTokenCounter";
+
+// Load the persisted token<->domain map on launch so favourited domain feeds
+// resolve after a restart. Call once from the constructor (before any hooks run).
+static void ApolloDomainListingsLoadRegistry(void) {
+    sTokenLock = [[NSLock alloc] init];
+    sDomainForToken = [NSMutableDictionary dictionary];
+    sTokenForDomain = [NSMutableDictionary dictionary];
+
+    NSDictionary *saved = [[NSUserDefaults standardUserDefaults] dictionaryForKey:kApolloDomainTokenMapKey];
+    if ([saved isKindOfClass:[NSDictionary class]]) {
+        [saved enumerateKeysAndObjectsUsingBlock:^(id token, id domain, BOOL *stop) {
+            if ([token isKindOfClass:[NSString class]] && [domain isKindOfClass:[NSString class]]) {
+                sDomainForToken[token] = domain;
+                sTokenForDomain[domain] = token;
+            }
+        }];
+    }
+    sTokenCounter = (NSUInteger)[[NSUserDefaults standardUserDefaults] integerForKey:kApolloDomainTokenCounterKey];
+    if (sTokenCounter < sDomainForToken.count) sTokenCounter = sDomainForToken.count;
+    ApolloLog(@"[DomainListings] Loaded %lu persisted domain token(s)", (unsigned long)sDomainForToken.count);
+}
+
+// Persist the map (called under sTokenLock when a new slug is minted).
+static void ApolloDomainListingsSaveRegistryLocked(void) {
+    [[NSUserDefaults standardUserDefaults] setObject:[sDomainForToken copy] forKey:kApolloDomainTokenMapKey];
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)sTokenCounter forKey:kApolloDomainTokenCounterKey];
+}
+
+// Stable, dot-free slug for a domain (reused across launches via the persisted
+// map). The slug is plain lowercase alphanumerics so Apollo's /r/ router accepts
+// it as an ordinary subreddit name.
+static NSString *ApolloDomainListingsTokenForDomain(NSString *domain) {
+    NSString *d = ApolloDomainListingsNormalizeDomain(domain);
+    if (!d) return nil;
+
+    [sTokenLock lock];
+    NSString *token = sTokenForDomain[d];
+    if (!token) {
+        token = [NSString stringWithFormat:@"ardomain%lu", (unsigned long)sTokenCounter++];
+        sTokenForDomain[d] = token;
+        sDomainForToken[token] = d;
+        ApolloDomainListingsSaveRegistryLocked();
+    }
+    [sTokenLock unlock];
+    return token;
+}
+
+// Domain backing a slug, or nil if it isn't one of ours.
+static NSString *ApolloDomainListingsDomainForToken(NSString *token) {
+    if (![token isKindOfClass:[NSString class]] || token.length == 0) return nil;
+    [sTokenLock lock];
+    NSString *d = sDomainForToken[token];
+    [sTokenLock unlock];
+    return d;
 }
 
 // A friendly display label for a domain: "imgur.com" -> "imgur",
@@ -148,22 +202,22 @@ NSString *ApolloDomainListingsDomainFromURL(NSURL *url) {
 }
 
 void ApolloDomainListingsOpen(NSString *domain) {
-    NSString *d = ApolloDomainListingsNormalizeDomain(domain);
-    if (!d) {
+    NSString *token = ApolloDomainListingsTokenForDomain(domain);
+    if (!token) {
         ApolloLog(@"[DomainListings] Open ignored — empty/invalid domain: %@", domain);
         return;
     }
 
-    // Open the domain AS a subreddit named after it. ApolloRouteResolvedURLViaApolloScheme
-    // converts this to apollo://reddit.com/r/<domain>/ and opens it via UIApplication,
-    // which re-enters our SceneDelegate hook (not as a /domain/ URL, so we don't loop)
-    // and lets Apollo push the PostsViewController. The path rewrite then turns the
-    // resulting r/<domain> listing request into the /domain/<domain> endpoint.
-    NSString *urlString = [NSString stringWithFormat:@"https://reddit.com/r/%@/", d];
+    // Open the domain behind its dot-free slug, which Apollo's /r/ router accepts
+    // as a normal subreddit. ApolloRouteResolvedURLViaApolloScheme converts this to
+    // apollo://reddit.com/r/<token>/ and opens it via UIApplication, which re-enters
+    // our SceneDelegate hook (not a /domain/ URL, so no loop) and lets Apollo push
+    // the PostsViewController. The path rewrite then maps r/<token> -> domain/<domain>.
+    NSString *urlString = [NSString stringWithFormat:@"https://reddit.com/r/%@/", token];
     NSURL *url = [NSURL URLWithString:urlString];
 
     dispatch_block_t route = ^{
-        ApolloLog(@"[DomainListings] Opening domain '%@' via %@", d, urlString);
+        ApolloLog(@"[DomainListings] Opening domain '%@' via %@", ApolloDomainListingsDomainForToken(token), urlString);
         if (!ApolloRouteResolvedURLViaApolloScheme(url)) {
             ApolloLog(@"[DomainListings] Route failed for %@", url);
         }
@@ -173,33 +227,43 @@ void ApolloDomainListingsOpen(NSString *domain) {
 }
 
 // =============================================================================
-// MARK: - API redirect: rewrite the listing PATH r/<domain> -> domain/<domain>
+// MARK: - API redirect: rewrite the listing PATH r/<token> -> domain/<domain>
 // =============================================================================
 //
 // Every typed links query (linksInSubredditWithName:category:…, its pagination
 // follow-ups, etc.) funnels into RDKClient's generic path-based listing builders
-// with a fully-formed path like "r/imgur.com/top" — and Apollo has already attached
+// with a fully-formed path like "r/ardomain0/top" — and Apollo has already attached
 // the sort suffix and any time-filter params (t=week, …). By rewriting only the
-// path PREFIX at that funnel ("r/<domain>" -> "domain/<domain>") and forwarding the
+// path PREFIX at that funnel ("r/<token>" -> "domain/<domain>") and forwarding the
 // parameters/pagination/completion untouched, sorting, time-filtering AND
 // pagination all work, with no dependency on RDKSubredditCategory's raw values.
 
-// "r/<domain>[/<sort>][.json]" -> "domain/<domain>[/<sort>][.json]" when the name
-// component is a domain (contains a dot). Only the "r" segment changes — the
-// domain, the sort suffix and any ".json" are preserved verbatim. Returns the SAME
-// object when there's nothing to rewrite, so callers detect a no-op via identity.
+// "r/<token>[/<sort>][.json]" -> "domain/<domain>[/<sort>][.json]" when <token> is
+// one of our domain slugs. A trailing ".json" on the slug component is split off
+// and re-attached to the domain. Returns the SAME object when there's nothing to
+// rewrite, so callers detect a no-op via identity.
 static NSString *ApolloDomainListingsRewriteListingPath(NSString *path) {
     if (![path isKindOfClass:[NSString class]] || path.length == 0) return path;
 
     NSArray<NSString *> *comps = [path componentsSeparatedByString:@"/"];
     for (NSUInteger i = 0; i + 1 < comps.count; i++) {
         if (![comps[i] isEqualToString:@"r"]) continue;
-        // The component after "r" carries the domain (with its dots). A real
-        // subreddit name has no dot, so this never matches normal feeds.
-        if (!ApolloDomainListingsDomainFromName(comps[i + 1])) continue;
+
+        NSString *slugComp = comps[i + 1];           // "ardomain0" or "ardomain0.json"
+        NSString *slug = slugComp;
+        NSString *ext = @"";
+        NSRange dot = [slugComp rangeOfString:@"."];
+        if (dot.location != NSNotFound) {
+            slug = [slugComp substringToIndex:dot.location];
+            ext = [slugComp substringFromIndex:dot.location]; // includes the "."
+        }
+
+        NSString *domain = ApolloDomainListingsDomainForToken(slug);
+        if (!domain) continue;
 
         NSMutableArray<NSString *> *out = [comps mutableCopy];
         out[i] = @"domain";
+        out[i + 1] = [domain stringByAppendingString:ext];
         NSString *rewritten = [out componentsJoinedByString:@"/"];
         ApolloLog(@"[DomainListings] Path rewrite '%@' -> '%@'", path, rewritten);
         return rewritten;
@@ -316,12 +380,12 @@ static NSString *ApolloDomainListingsRewriteListingPath(NSString *path) {
 // read by the ApolloSubredditHeaders banner as a fallback) plus every matching
 // UILabel in the title view. Re-applied on layout so it survives nav-bar relayout.
 
-// Map a displayed string ("imgur.com", "r/imgur.com") to its domain, or nil.
+// Map a displayed string ("ardomain0", "r/ardomain0") to its domain, or nil.
 static NSString *ApolloDomainListingsDomainForDisplayText(NSString *text) {
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return nil;
     NSString *candidate = text;
     if ([candidate hasPrefix:@"r/"] || [candidate hasPrefix:@"R/"]) candidate = [candidate substringFromIndex:2];
-    return ApolloDomainListingsDomainFromName(candidate);
+    return ApolloDomainListingsDomainForToken(candidate);
 }
 
 // Find the domain encoded in any UILabel within a view tree (e.g. the title view).
@@ -430,6 +494,8 @@ static void ApolloDomainListingsFixDomainTitle(UIViewController *vc) {
 // =============================================================================
 
 %ctor {
+    ApolloDomainListingsLoadRegistry();
+
     Class sceneDelegate = objc_getClass("_TtC6Apollo13SceneDelegate");
     Class appDelegate = objc_getClass("_TtC6Apollo11AppDelegate");
     Class postsVC = objc_getClass("_TtC6Apollo19PostsViewController");
